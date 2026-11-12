@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS announcements (
     chain_status    TEXT,                           -- ok / conflict / cancelled / orphan
     conflict_reasons TEXT,                          -- 冲突原因，JSON 数组字符串
     effective_deadline TEXT,                        -- 有效截止时间（计算结果）
+    blocked_by_notice_no TEXT,                      -- 阻断该孤立公告的撤销公告编号
     last_synced_at  TEXT NOT NULL,                  -- 最近一次同步时间
     last_fetch_error TEXT                           -- 最近一次详情抓取错误（成功后清空）
 );
@@ -59,4 +60,13 @@ def connect() -> sqlite3.Connection:
 
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+    # 兼容旧库：CREATE TABLE IF NOT EXISTS 不会为已存在的表补列
+    existing = {
+        r["name"]
+        for r in conn.execute("PRAGMA table_info(announcements)").fetchall()
+    }
+    if "blocked_by_notice_no" not in existing:
+        conn.execute(
+            "ALTER TABLE announcements ADD COLUMN blocked_by_notice_no TEXT"
+        )
     conn.commit()

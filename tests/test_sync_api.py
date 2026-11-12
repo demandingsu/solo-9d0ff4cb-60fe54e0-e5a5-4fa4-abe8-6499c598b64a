@@ -16,15 +16,15 @@ def test_full_sync_and_counts(client, site_base_url):
     assert resp.status_code == 200
     body = resp.json()
     assert body["status"] == "success"
-    assert body["total_listed"] == 17
-    assert body["fetched_ok"] == 17
+    assert body["total_listed"] == 23
+    assert body["fetched_ok"] == 23
     assert body["failed_count"] == 0
 
     result = c.get("/api/v1/chains").json()
-    # 6 条链：A、B、C、G-001、G-101、H
-    assert len(result["chains"]) == 6
-    # 5 条孤立异常：D-001、E-001、E-002、F-001
-    assert len(result["orphans"]) == 4
+    # 7 条链：A、B、C、G-001、G-101、H、I-001
+    assert len(result["chains"]) == 7
+    # 7 条孤立异常：D-001、E-001、E-002、F-001、I-004、I-005、I-006
+    assert len(result["orphans"]) == 7
 
 
 def test_normal_chain_status_and_effective_deadline(client, site_base_url):
@@ -69,6 +69,39 @@ def test_parallel_corrections_conflict_without_guessing_deadline(
     for ann in chain["announcements"]:
         assert "parallel_correction" in ann["conflict_reasons"]
         assert ann["effective_deadline"] is None
+
+
+def test_forks_after_revocation_are_orphans_not_conflict(client, site_base_url):
+    """撤销之后的并行更正与隔代后继：原链保持 cancelled，后继全部孤立。"""
+    c, _ = client
+    c.post("/api/v1/sync", json={"list_url": f"{site_base_url}/announcements"})
+    result = c.get("/api/v1/chains").json()
+    chains = _chains_by_id(result)
+    orphans = _orphans_by_no(result)
+
+    # 原链 I-001 仍为已撤销：分叉不能改变状态，截止时间保持 null
+    chain_i = chains["I-001"]
+    assert chain_i["status"] == "cancelled"
+    assert chain_i["effective_deadline"] is None
+    assert [a["notice_no"] for a in chain_i["announcements"]] == [
+        "I-001", "I-002", "I-003"
+    ]
+    for ann in chain_i["announcements"]:
+        assert "parallel_correction" not in ann["conflict_reasons"]
+
+    # 撤销后的直接并行后继与隔代后继都作为孤立异常
+    for no in ("I-004", "I-005", "I-006"):
+        orphan = orphans[no]
+        assert orphan["status"] == "orphan"
+        assert "entry_after_revocation" in orphan["conflict_reasons"]
+        assert "parallel_correction" not in orphan["conflict_reasons"]
+        assert orphan["effective_deadline"] is None
+        # 阻断它们的撤销编号与来源链接
+        assert orphan["blocked_by_notice_no"] == "I-003"
+        assert orphan["source_url"].endswith(f"/notice/{no}")
+
+    # I-006 是隔代后继（父 I-005 本身也是孤立项），仍能溯源到 I-003
+    assert orphans["I-006"]["ref_notice_no"] == "I-005"
 
 
 def test_same_project_first_notices_remain_independent(client, site_base_url):
@@ -144,7 +177,7 @@ def test_sync_runs_recorded_and_health(client, site_base_url):
     runs = c.get("/api/v1/sync-runs").json()["runs"]
     assert len(runs) == 1
     assert runs[0]["status"] == "success"
-    assert runs[0]["total_listed"] == 17
+    assert runs[0]["total_listed"] == 23
 
 
 def test_sync_bad_url_rejected(client):

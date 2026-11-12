@@ -122,6 +122,7 @@ def query_chains() -> dict:
             publish_time=r["publish_time"],
             deadline=r["deadline"],
             ref_notice_no=r["ref_notice_no"],
+            blocked_by_notice_no=r["blocked_by_notice_no"],
         )
         for r in orphan_rows
     ]

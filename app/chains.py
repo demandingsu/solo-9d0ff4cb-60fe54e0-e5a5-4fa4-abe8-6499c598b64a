@@ -12,8 +12,11 @@
      - reference_cycle：引用关系成环；
      - parallel_correction：同一公告存在两个及以上并行后继（并行更正）；
      - first_notice_with_reference：首次公告却带引用编号（结构异常）。
+   注意：并行更正只在链内（撤销边界之前）才构成冲突。撤销公告之后出现的
+   分叉后继不进入原链，因此不能改变原链的已撤销状态，按孤立异常处理。
 4. 撤销使整条链失效：链状态为 cancelled，有效截止时间为 null；
-   撤销之后又挂接的公告不再属于该链，作为孤立异常公告处理。
+   撤销之后又挂接的公告（直接后继及任意多级后继）不再属于该链，统一作为
+   孤立异常处理，原因 entry_after_revocation，并记录阻断它们的撤销编号。
 5. 无法归入任何链的公告进入 orphans（孤立异常公告）。
 """
 from __future__ import annotations
@@ -44,9 +47,8 @@ def recompute(conn: sqlite3.Connection) -> None:
     notices = {r["notice_no"]: dict(r) for r in rows}
 
     conflicts: dict[str, set[str]] = defaultdict(set)
-    # 被引用编号 -> 后继公告列表
+    # 被引用编号 -> 后继公告列表（仅引用存在时）
     successors: dict[str, list[str]] = defaultdict(list)
-    # 父公告编号 -> 后继公告列表（仅引用存在时）
     for n in notices.values():
         ref = n["ref_notice_no"]
         if n["notice_type"] != FIRST and not ref:
@@ -57,13 +59,6 @@ def recompute(conn: sqlite3.Connection) -> None:
                 conflicts[n["notice_no"]].add(MISSING_REFERENCE)
             else:
                 successors[ref].append(n["notice_no"])
-
-    # 并行后继：同一公告被多个公告引用（典型为并行更正）
-    for parent_no, children in successors.items():
-        if len(children) > 1:
-            conflicts[parent_no].add(PARALLEL_CORRECTION)
-            for child in children:
-                conflicts[child].add(PARALLEL_CORRECTION)
 
     # 首次公告带引用：结构异常
     for n in notices.values():
@@ -79,7 +74,8 @@ def recompute(conn: sqlite3.Connection) -> None:
         if n["notice_type"] == FIRST and REFERENCE_CYCLE not in conflicts[no]
     ]
 
-    # BFS 收集每条链的成员；撤销节点之后不再向下展开
+    # BFS 收集每条链的成员；撤销节点之后不再向下展开。
+    # 先确定链归属，再识别并行后继，确保撤销之后的分叉不参与冲突判定。
     chain_members: dict[str, list[str]] = {}
     membership: dict[str, str] = {}
     for root in roots:
@@ -100,17 +96,35 @@ def recompute(conn: sqlite3.Connection) -> None:
                     queue.append(child)
         chain_members[root] = members
 
+    # 并行后继只在链内（撤销边界之前）构成冲突。
+    # 撤销公告自身虽在链上，但它的后继已被排除在链外，其分叉不得把原链的
+    # cancelled 状态改写成 conflict；链外节点之间的分叉同理不打标。
+    for parent_no, children in successors.items():
+        parent = notices.get(parent_no)
+        if parent is None or len(children) <= 1:
+            continue
+        if parent_no not in membership or parent["notice_type"] == REVOCATION:
+            continue
+        conflicts[parent_no].add(PARALLEL_CORRECTION)
+        for child in children:
+            conflicts[child].add(PARALLEL_CORRECTION)
+
     # 孤立公告：未归入任何链的公告
     orphans = [no for no in notices if no not in membership]
 
-    # 撤销之后仍挂接的公告：给出更具体的原因
+    # 撤销之后挂接的公告：直接后继与任意多级后继都沿引用向上追溯到阻断
+    # 它们的撤销公告，统一给出 entry_after_revocation 与撤销编号。
+    blocked_by: dict[str, Optional[str]] = {}
     for no in orphans:
-        ref = notices[no]["ref_notice_no"]
-        if ref and ref in notices and notices[ref]["notice_type"] == REVOCATION:
+        revocation_no = _find_blocking_revocation(notices, no)
+        if revocation_no is not None:
+            blocked_by[no] = revocation_no
             conflicts[no].add(ENTRY_AFTER_REVOCATION)
-        elif ref and ref in membership:
-            # 父节点在链上但自己未被收编（例如位于撤销之后的更下游）
-            conflicts[no].add(UNREACHABLE)
+        else:
+            ref = notices[no]["ref_notice_no"]
+            if ref and ref in membership:
+                # 兜底：父节点在链上但自己未被收编（正常结构下不应到达）
+                conflicts[no].add(UNREACHABLE)
 
     # 计算每条链的状态与有效截止时间
     chain_updates: dict[str, tuple[str, Optional[str], Optional[str]]] = {}
@@ -134,7 +148,8 @@ def recompute(conn: sqlite3.Connection) -> None:
     # 落库：先重置全部公告的计算字段
     conn.execute(
         "UPDATE announcements SET chain_id = NULL, chain_status = 'orphan', "
-        "conflict_reasons = NULL, effective_deadline = NULL"
+        "conflict_reasons = NULL, effective_deadline = NULL, "
+        "blocked_by_notice_no = NULL"
     )
     for root, members in chain_members.items():
         status, effective, reasons_json = chain_updates[root]
@@ -156,10 +171,35 @@ def recompute(conn: sqlite3.Connection) -> None:
         per_notice = sorted(conflicts[no])
         conn.execute(
             "UPDATE announcements SET chain_id = NULL, chain_status = 'orphan', "
-            "conflict_reasons = ?, effective_deadline = NULL WHERE notice_no = ?",
-            (json.dumps(per_notice, ensure_ascii=False) if per_notice else None, no),
+            "conflict_reasons = ?, effective_deadline = NULL, "
+            "blocked_by_notice_no = ? WHERE notice_no = ?",
+            (
+                json.dumps(per_notice, ensure_ascii=False) if per_notice else None,
+                blocked_by.get(no),
+                no,
+            ),
         )
     conn.commit()
+
+
+def _find_blocking_revocation(
+    notices: dict[str, dict], notice_no: str
+) -> Optional[str]:
+    """沿引用链向上追溯阻断该公告的撤销公告编号，不存在则返回 None。
+
+    适用于撤销之后挂接的直接及多级后继：无论间隔多少层，只要上游存在
+    撤销公告，就返回沿引用路径遇到的第一个（最近的）撤销编号。
+    追溯过程中遇到缺失引用或回到自身（成环）即停止，避免无限循环。
+    """
+    current = notices[notice_no].get("ref_notice_no")
+    visited: set[str] = set()
+    while current and current in notices and current not in visited:
+        visited.add(current)
+        node = notices[current]
+        if node["notice_type"] == REVOCATION:
+            return current
+        current = node["ref_notice_no"]
+    return None
 
 
 def _mark_cycles(

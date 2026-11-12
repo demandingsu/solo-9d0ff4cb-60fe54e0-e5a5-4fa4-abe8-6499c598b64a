@@ -41,6 +41,10 @@ class OrphanAnnouncement(BaseModel):
     publish_time: Optional[str] = None
     deadline: Optional[str] = None
     ref_notice_no: Optional[str] = None
+    blocked_by_notice_no: Optional[str] = Field(
+        None,
+        description="撤销之后挂接的后继：阻断它的撤销公告编号",
+    )
 
 
 class QueryResponse(BaseModel):

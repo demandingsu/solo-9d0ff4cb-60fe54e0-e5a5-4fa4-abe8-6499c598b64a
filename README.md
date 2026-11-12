@@ -24,7 +24,7 @@
 ├── sample_site/            # 示例公告站（仅 Python 标准库）
 │   ├── server.py
 │   └── Dockerfile
-├── tests/                  # pytest 测试（19 个用例）
+├── tests/                  # pytest 测试（23 个用例）
 ├── Dockerfile              # API 镜像
 ├── docker-compose.yml      # api + sample-site 两个服务
 └── requirements.txt
@@ -112,7 +112,17 @@ pytest -q
       "conflict_reasons": ["missing_reference"],
       "ref_notice_no": "X-999",
       "effective_deadline": null,
-      "source_url": "http://sample-site:8080/notice/D-001"
+      "source_url": "http://sample-site:8080/notice/D-001",
+      "blocked_by_notice_no": null
+    },
+    {
+      "notice_no": "I-006",
+      "status": "orphan",
+      "conflict_reasons": ["entry_after_revocation"],
+      "ref_notice_no": "I-005",
+      "effective_deadline": null,
+      "source_url": "http://sample-site:8080/notice/I-006",
+      "blocked_by_notice_no": "I-003"
     }
   ]
 }
@@ -133,8 +143,12 @@ pytest -q
   - `conflict`：链上存在冲突，**不推测截止时间**，有效截止时间为 `null`。
 - 有效截止时间：取链上明确给出的最新截止时间；更正未给出截止时间时沿用链上
   此前的截止时间（继承已有数据，而非推测）。
-- 撤销公告之后又挂接的公告不再属于该链，作为孤立异常公告处理
-  （原因 `entry_after_revocation`）。
+- 撤销公告之后又挂接的公告（直接后继及任意多级后继）不再属于该链，统一作为
+  孤立异常公告处理（原因 `entry_after_revocation`），并通过
+  `blocked_by_notice_no` 返回阻断它们的撤销公告编号。
+- **撤销之后的分叉不构成并行冲突**：即使两条更正同时引用同一条撤销公告，
+  原链仍保持 `cancelled`、有效截止时间为 `null`；这些后继按孤立异常处理。
+  只有撤销边界**之前**的并行更正才会使原链报 `parallel_correction` 冲突。
 
 ### 冲突识别（冲突即不推测截止时间）
 
@@ -142,11 +156,13 @@ pytest -q
 | --- | --- |
 | `missing_reference` | 引用编号在库中不存在；或更正/撤销公告未填引用编号 |
 | `reference_cycle` | 引用关系成环（含自环） |
-| `parallel_correction` | 同一公告被两个及以上公告引用（并行更正） |
+| `parallel_correction` | 同一公告被两个及以上公告引用（并行更正）；撤销之后的分叉不计 |
 | `first_notice_with_reference` | 首次公告却携带引用编号（结构异常） |
+| `entry_after_revocation` | 撤销公告之后挂接的直接或多级后继，随孤立公告返回 `blocked_by_notice_no` |
 
 无法归入任何链的公告进入 `orphans`，每条都带状态、冲突原因、来源链接，
-且有效截止时间为 `null`。
+且有效截止时间为 `null`；其中撤销之后的后继额外返回 `blocked_by_notice_no`
+（阻断它的撤销公告编号）。
 
 ### 详情抓取失败的容错
 
@@ -168,6 +184,7 @@ pytest -q
 | E-001 / E-002 | 互相引用成环 | 孤立，reference_cycle |
 | F-001 | 更正公告无引用编号 | 孤立，missing_reference |
 | G-001 / G-101（+G-102） | 同项目两个独立首次公告 | 两条独立链 |
+| I-001 ~ I-006 | 撤销后两条更正并行引用撤销公告，其中一条再被更正 | 原链保持 `cancelled`；I-004/I-005/I-006 孤立，原因 `entry_after_revocation`，`blocked_by_notice_no=I-003` |
 | H-001 | 可切换 500 故障 | 验证失败保留上次结果 |
 
 故障开关（仅示例站）：
